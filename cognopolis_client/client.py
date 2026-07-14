@@ -290,6 +290,96 @@ class Client:
         """Cancel your open order (M5 Срез 2b) — refunds remaining escrow."""
         return self._action("/actions/cancel_order", json={"order_id": order_id, "reason": reason})
 
+    # ---- Подземье (П4, D-079/D-081) ----
+    # Имена разводят ИГРОВОЙ спуск (mine_descend — войти в шахту с поверхности, действие игры)
+    # и СЕРВИСНЫЙ спуск по стволу (mine_down — на горизонт ниже, действие шахты). Игровые мосты
+    # отвечают конвертом {result, cooldown, character}; сервисные пути /mine/* того же origin —
+    # конвертом {result, cooldown, miner} (тот же Bearer-под-токен). wait_cooldown() работает
+    # с обоими: поле cooldown живёт в корне обоих конвертов.
+
+    def mine_descend(self, reason: str | None = None) -> dict:
+        """Спуститься в Подземье (игровой мост): начать забег. Требует стоять на тайле входа
+        mine_entrance (1,6) — дойди move_dir-ом. Под землёй поверхностные действия и ротация
+        токена заперты (in_mine) до mine_return(); забег ведут mine_*-методы ниже. Returns
+        {result: {outcome: "descended", horizon, x, y, hp, satchel_cap}, cooldown, character}.
+        Recovered-форма (сервер восстановил привязку уже идущего забега): result несёт ТОЛЬКО
+        {outcome: "descended", recovered: True} — позиции/hp/satchel_cap в нём НЕ обещаны,
+        добирай их mine_observe(). Errors: in_mine / not_at_mine_entrance / demo_forbidden /
+        token_rotated (токен сменился в окне спуска — повтори текущим) /
+        character_on_cooldown / mine_disabled | mine_unavailable (503)."""
+        return self._action("/actions/mine/descend", json={"reason": reason})
+
+    def mine_return(self, reason: str | None = None) -> dict:
+        """Вернуться из Подземья (игровой мост): рассчитать ЗАКОНЧЕННЫЙ забег — руда манифеста
+        зачисляется в рюкзак (overfill-ом, без потерь), hp := hp_final; гибель: руда 0, hp=1,
+        житель у входа. Забег сперва финализируй в шахте: поднимись на entry горизонта 1 и
+        mine_up() — иначе run_still_active. Повторный вызов — объясняющий отказ (расчёт
+        идемпотентен). Returns {result: {outcome: "exited"|"death"|"desynced", ore, hp},
+        cooldown, character}. Errors: not_in_mine / run_still_active / nothing_to_settle /
+        boundary_contract (502) / mine_disabled | mine_unavailable (503)."""
+        return self._action("/actions/mine/return", json={"reason": reason})
+
+    def mine_move(self, direction: str, reason: str | None = None) -> dict:
+        """Шаг по горизонту шахты (сервис, конверт {result, cooldown, miner}): direction —
+        один из DIRECTIONS (контракт-зеркало D-069). Errors: at_map_edge /
+        character_on_cooldown / invalid_token (нет активного забега)."""
+        return self._action(f"/mine/actions/move/{direction}", json={"reason": reason})
+
+    def mine_down(self, reason: str | None = None) -> dict:
+        """Спуск по стволу на горизонт ниже (сервис) — только с descent-тайла под ногами.
+        В срезе 1 глубже не прорыто: честный отказ horizon_not_dug. Errors: no_shaft_here /
+        horizon_not_dug / character_on_cooldown / invalid_token."""
+        return self._action("/mine/actions/descend", json={"reason": reason})
+
+    def mine_up(self, reason: str | None = None) -> dict:
+        """Подъём по стволу (сервис) — только с тайла ствола. ascend на entry горизонта 1 =
+        ВЫХОД: финализация забега (result {outcome: "exited", ore}); после неё под-токен
+        перестаёт работать в /mine/* — зови mine_return() за зачислением. Errors:
+        no_shaft_here / run_not_active (уже финализирован) / character_on_cooldown /
+        invalid_token."""
+        return self._action("/mine/actions/ascend", json={"reason": reason})
+
+    def mine_trial(self) -> dict:
+        """Испытание жилы под ногами (сервис; бесплатно, без кулдауна): {class_key, lore_title,
+        answer_kind, question, artifacts: [{name, size}], ore, ore_qty, attempt_budget,
+        progress: {series, misses, budget_left, solved}}. Байты артефактов —
+        mine_trial_files(); ответ — mine_attempt(answer, series=progress['series']).
+        Errors: no_vein_here / vein_depleted / invalid_token."""
+        return self._request("GET", "/mine/trial", auth=True)
+
+    def mine_trial_files(self) -> dict:
+        """Скачать ВСЕ артефакты испытания под ногами: {имя: bytes} — ровно та форма
+        Mapping[str, bytes], которую ест решатель (mine-репо examples/solver.py: solve(files)).
+        Errors: как у mine_trial + artifact_not_found."""
+        trial = self.mine_trial()
+        return {a["name"]: self._request_bytes(f"/mine/trial/files/{a['name']}")
+                for a in trial["artifacts"]}
+
+    def mine_attempt(self, answer: str, series: int | None = None,
+                     reason: str | None = None) -> dict:
+        """Подать ответ испытания (сервис). hit → руда во вьюк (+solved/XP-стейджинг); miss →
+        hp−1, бюджет−1; hp=0 → гибель (забег финализирован, вьюк сгорел). `series` из
+        mine_trial() передавай всегда: протухшую подачу (жила реставрирована) сервис отвергнет
+        объясняющим series_changed ДО урона. Returns {result: {outcome: "hit"|"miss", ...},
+        cooldown, miner}. Errors: no_vein_here / vein_depleted / satchel_full /
+        attempt_budget_exhausted / series_changed / character_on_cooldown / invalid_token."""
+        return self._action("/mine/actions/attempt",
+                            json={"answer": answer, "series": series, "reason": reason})
+
+    def mine_observe(self, token: str | None = None) -> dict:
+        """Свой житель в шахте (сервис, публичный путь, токен В QUERY — без Bearer):
+        {run_id, horizon, x, y, hp, satchel, satchel_cap, cooldown, tile, trial, journal}.
+        Токен по умолчанию — свой (client.token); работает ТОЛЬКО при активном забеге
+        (finalized → invalid_token — читай итог через mine_return())."""
+        return self._request("GET", f"/mine/observe?token={token or self.token or ''}")
+
+    def mine_map(self, horizon: int | None = None) -> dict:
+        """Карта горизонта шахты (сервис, публичная, без auth): {size, tiles: [{x, y,
+        content}], miners: [{x, y}]} — content: entry|descent|vein|empty; силуэты шахтёров
+        анонимны. Раскладка статична (детерминирована сидом мира) — кэшируй смело."""
+        return self._request("GET", "/mine/map" +
+                             (f"?horizon={horizon}" if horizon is not None else ""))
+
     def get_events(self, limit: int = 50) -> list:
         return self._request("GET", f"/events?limit={limit}", auth=True)
 
@@ -364,6 +454,26 @@ class Client:
                 err = {}
             raise GameError(err.get("code", "http_error"), err.get("message", r.text), r.status_code)
         return r.json()
+
+    def _request_bytes(self, path: str) -> bytes:
+        """Аутентифицированный GET сырых байт (артефакты испытаний Подземья — настоящие файлы,
+        D-079 №28): тот же конверт ошибок, но тело НЕ парсится как JSON."""
+        if not self.token:
+            raise GameError(
+                "no_token",
+                "No game-token — pass Client(token=...) with your account's token, "
+                "or call register()/login() first.", 0)
+        try:
+            r = self._http.get(path, headers={"Authorization": f"Bearer {self.token}"})
+        except httpx.HTTPError as e:
+            raise GameError("transport_error", str(e), 0) from e
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", {})
+            except Exception:
+                err = {}
+            raise GameError(err.get("code", "http_error"), err.get("message", r.text), r.status_code)
+        return r.content
 
     def _request(self, method: str, path: str, json: dict | None = None, auth: bool = False) -> dict:
         headers = {}
